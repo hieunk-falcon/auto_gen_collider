@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 
@@ -7,8 +8,11 @@ public class ColliderAutoFitterWindow : EditorWindow
     static void Open() => GetWindow<ColliderAutoFitterWindow>("Collider Auto Fitter");
 
     ColliderAutoFitter.ShapeOverride _shapeOverride = ColliderAutoFitter.ShapeOverride.Auto;
+    readonly List<GameObject> _dropTargets = new List<GameObject>();
+    Vector2 _scroll;
     bool _showHelp;
 
+    // Repaint while the mouse is inside the window so drop highlight updates.
     void OnGUI()
     {
         EditorGUILayout.LabelField("Auto-Fit Collider to Selection", EditorStyles.boldLabel);
@@ -42,27 +46,42 @@ public class ColliderAutoFitterWindow : EditorWindow
 
         EditorGUILayout.Space();
 
+        // ── Drop zone ─────────────────────────────────────────────────────
+        DrawDropZone();
+
+        EditorGUILayout.Space();
+
+        // ── Target list ───────────────────────────────────────────────────
+        var allTargets = BuildTargetList();
+
+        if (allTargets.Count > 0)
+        {
+            EditorGUILayout.LabelField($"Will process {allTargets.Count} object(s):", EditorStyles.boldLabel);
+            _scroll = EditorGUILayout.BeginScrollView(_scroll, GUILayout.MaxHeight(80));
+            foreach (var go in allTargets)
+                EditorGUILayout.ObjectField(go, typeof(GameObject), true);
+            EditorGUILayout.EndScrollView();
+        }
+        else
+        {
+            EditorGUILayout.LabelField("No objects selected or dropped.", EditorStyles.centeredGreyMiniLabel);
+        }
+
+        EditorGUILayout.Space();
+
         // ── Fit button ────────────────────────────────────────────────────
-        GUI.enabled = Selection.gameObjects.Length > 0;
-        if (GUILayout.Button("Fit Collider to Selected Object(s)", GUILayout.Height(36)))
+        GUI.enabled = allTargets.Count > 0;
+        if (GUILayout.Button("Fit Collider(s)", GUILayout.Height(36)))
         {
             Undo.SetCurrentGroupName("Auto Fit Colliders");
             int group = Undo.GetCurrentGroup();
-            int count = 0;
-            foreach (var go in Selection.gameObjects)
-            {
+            foreach (var go in allTargets)
                 ColliderAutoFitter.FitCollider(go, _shapeOverride);
-                count++;
-            }
             Undo.CollapseUndoOperations(group);
-            Debug.Log($"[ColliderAutoFitter] Processed {count} object(s).");
+            Debug.Log($"[ColliderAutoFitter] Processed {allTargets.Count} object(s).");
+            _dropTargets.Clear();
         }
         GUI.enabled = true;
-
-        EditorGUILayout.Space();
-        EditorGUILayout.LabelField("Selected:", Selection.gameObjects.Length > 0
-            ? string.Join(", ", System.Array.ConvertAll(Selection.gameObjects, g => g.name))
-            : "(none)", EditorStyles.miniLabel);
 
         EditorGUILayout.Space();
         _showHelp = EditorGUILayout.Foldout(_showHelp, "How it works", true);
@@ -84,5 +103,100 @@ public class ColliderAutoFitterWindow : EditorWindow
                 "  Use for: buckets, baskets, bowls, crates.",
                 MessageType.None);
         }
+    }
+
+    // Returns union of scene-selection + manually dropped objects (deduped).
+    List<GameObject> BuildTargetList()
+    {
+        var result = new List<GameObject>(Selection.gameObjects);
+        foreach (var go in _dropTargets)
+            if (go != null && !result.Contains(go))
+                result.Add(go);
+        return result;
+    }
+
+    void DrawDropZone()
+    {
+        // Reserve a fixed-height rect for the drop zone.
+        Rect dropRect = GUILayoutUtility.GetRect(0, 48, GUILayout.ExpandWidth(true));
+
+        bool isHover = dropRect.Contains(Event.current.mousePosition);
+        bool isDragging = DragAndDrop.objectReferences != null &&
+                          DragAndDrop.objectReferences.Length > 0;
+
+        Color boxColor = (isHover && isDragging)
+            ? new Color(0.3f, 0.7f, 1f, 0.35f)
+            : new Color(0.5f, 0.5f, 0.5f, 0.15f);
+
+        EditorGUI.DrawRect(dropRect, boxColor);
+
+        // Dashed border
+        Color borderColor = (isHover && isDragging)
+            ? new Color(0.3f, 0.7f, 1f, 0.9f)
+            : new Color(0.6f, 0.6f, 0.6f, 0.6f);
+        DrawBorder(dropRect, borderColor);
+
+        string label = _dropTargets.Count > 0
+            ? $"{_dropTargets.Count} object(s) dropped  (drag more or clear below)"
+            : "Drag GameObjects here";
+        GUIStyle labelStyle = new GUIStyle(EditorStyles.centeredGreyMiniLabel) { fontSize = 11 };
+        GUI.Label(dropRect, label, labelStyle);
+
+        // Clear button (top-right corner)
+        if (_dropTargets.Count > 0)
+        {
+            Rect clearBtn = new Rect(dropRect.xMax - 52, dropRect.y + 2, 50, 18);
+            if (GUI.Button(clearBtn, "Clear", EditorStyles.miniButton))
+                _dropTargets.Clear();
+        }
+
+        HandleDropEvents(dropRect);
+    }
+
+    void HandleDropEvents(Rect dropRect)
+    {
+        Event evt = Event.current;
+        if (!dropRect.Contains(evt.mousePosition)) return;
+
+        switch (evt.type)
+        {
+            case EventType.DragUpdated:
+                DragAndDrop.visualMode = HasGameObjects(DragAndDrop.objectReferences)
+                    ? DragAndDropVisualMode.Copy
+                    : DragAndDropVisualMode.Rejected;
+                evt.Use();
+                Repaint();
+                break;
+
+            case EventType.DragPerform:
+                DragAndDrop.AcceptDrag();
+                foreach (var obj in DragAndDrop.objectReferences)
+                {
+                    if (obj is GameObject go && !_dropTargets.Contains(go))
+                        _dropTargets.Add(go);
+                }
+                evt.Use();
+                Repaint();
+                break;
+
+            case EventType.DragExited:
+                Repaint();
+                break;
+        }
+    }
+
+    static bool HasGameObjects(Object[] refs)
+    {
+        foreach (var o in refs)
+            if (o is GameObject) return true;
+        return false;
+    }
+
+    static void DrawBorder(Rect r, Color c)
+    {
+        EditorGUI.DrawRect(new Rect(r.x,            r.y,            r.width, 1),      c);
+        EditorGUI.DrawRect(new Rect(r.x,            r.yMax - 1,     r.width, 1),      c);
+        EditorGUI.DrawRect(new Rect(r.x,            r.y,            1,       r.height), c);
+        EditorGUI.DrawRect(new Rect(r.xMax - 1,     r.y,            1,       r.height), c);
     }
 }
