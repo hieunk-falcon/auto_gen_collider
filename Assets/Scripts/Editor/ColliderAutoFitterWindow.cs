@@ -8,6 +8,7 @@ public class ColliderAutoFitterWindow : EditorWindow
     static void Open() => GetWindow<ColliderAutoFitterWindow>("Collider Auto Fitter");
 
     ColliderAutoFitter.ShapeOverride _shapeOverride = ColliderAutoFitter.ShapeOverride.Auto;
+    int _resolution = ColliderAutoFitter.DEFAULT_RESOLUTION;
     readonly List<GameObject> _dropTargets = new List<GameObject>();
     Vector2 _scroll;
     bool _showHelp;
@@ -18,22 +19,31 @@ public class ColliderAutoFitterWindow : EditorWindow
         EditorGUILayout.LabelField("Auto-Fit Collider to Selection", EditorStyles.boldLabel);
         EditorGUILayout.Space();
 
+        // ── Voxel resolution ──────────────────────────────────────────────
+        EditorGUILayout.LabelField("Voxelization", EditorStyles.boldLabel);
+        _resolution = EditorGUILayout.IntSlider(
+            new GUIContent("Resolution",
+                "Grid resolution along the longest axis.\n" +
+                "Higher = more accurate but slower (32 is good for most objects)."),
+            _resolution, 8, 64);
+        EditorGUILayout.Space();
+
         // ── Shape override ────────────────────────────────────────────────
         EditorGUILayout.LabelField("Shape Override", EditorStyles.boldLabel);
         _shapeOverride = (ColliderAutoFitter.ShapeOverride)EditorGUILayout.EnumPopup(
             new GUIContent("Shape",
-                "Auto       — detect from mesh (convexity + PCA)\n" +
-                "Container  — hollow open-top object: N wall boxes + bottom box\n" +
-                "Sphere / Capsule / Box — force that primitive, size fit to mesh bounds"),
+                "Auto      — open mesh (barrel/bowl) → Container; closed mesh → best primitive\n" +
+                "Container — force wall boxes + bottom (hollow open-top objects)\n" +
+                "Sphere / Capsule / Box — force that primitive"),
             _shapeOverride);
 
         if (_shapeOverride == ColliderAutoFitter.ShapeOverride.Container)
         {
             EditorGUILayout.HelpBox(
-                "Container mode: generates " +
-                "8 wall BoxColliders arranged radially\n" +
-                "+ 1 flat BoxCollider for the bottom.\n" +
-                "Sized automatically from the mesh bounds.",
+                "Container mode: 8 wall BoxColliders arranged radially\n" +
+                "+ 1 bottom BoxCollider.\n" +
+                "Wall thickness is derived from the mesh geometry (inner/outer radius).\n" +
+                "Best for: barrels, buckets, bowls, crates.",
                 MessageType.Info);
         }
         else if (_shapeOverride != ColliderAutoFitter.ShapeOverride.Auto)
@@ -76,7 +86,7 @@ public class ColliderAutoFitterWindow : EditorWindow
             Undo.SetCurrentGroupName("Auto Fit Colliders");
             int group = Undo.GetCurrentGroup();
             foreach (var go in allTargets)
-                ColliderAutoFitter.FitCollider(go, _shapeOverride);
+                ColliderAutoFitter.FitCollider(go, _shapeOverride, _resolution);
             Undo.CollapseUndoOperations(group);
             Debug.Log($"[ColliderAutoFitter] Processed {allTargets.Count} object(s).");
             _dropTargets.Clear();
@@ -89,18 +99,16 @@ public class ColliderAutoFitterWindow : EditorWindow
         {
             EditorGUILayout.HelpBox(
                 "AUTO:\n" +
-                "  Convexity = |signed vol| / OBB vol\n" +
-                "  \u2265 35%  \u2192  1 primitive\n" +
-                "  < 35%  \u2192  recursive PCA bisection \u2192 compound\n\n" +
-                "  Shape (PCA extents e0 \u2265 e1 \u2265 e2):\n" +
-                "    e0/e2 < 1.35                    \u2192 Sphere\n" +
-                "    e0/e2 \u2265 2.0, round cross-section \u2192 Capsule\n" +
-                "    otherwise                       \u2192 Box (OBB)\n\n" +
+                "  Open mesh (has boundary edges) → Container mode\n" +
+                "    e.g. barrel, bucket, bowl with open top\n" +
+                "  Closed mesh → Voxelize + Decompose + best primitive\n\n" +
                 "CONTAINER:\n" +
-                "  Skips convexity check.\n" +
-                "  Generates 8 wall slabs (BoxCollider) at equal angles\n" +
-                "  around the rim + 1 flat BoxCollider at the bottom.\n" +
-                "  Use for: buckets, baskets, bowls, crates.",
+                "  8 wall BoxColliders at equal angles around height axis\n" +
+                "  + 1 bottom BoxCollider.\n" +
+                "  Wall thickness derived from inner/outer mesh radius.\n\n" +
+                "FORCED PRIMITIVE:\n" +
+                "  Voxelizes mesh and fits chosen primitive\n" +
+                "  to the tightest bounding volume.",
                 MessageType.None);
         }
     }
