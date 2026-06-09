@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text;
 using UnityEditor;
 using UnityEngine;
 
@@ -7,53 +8,106 @@ public class ColliderAutoFitterWindow : EditorWindow
     [MenuItem("Tools/Collider Auto Fitter")]
     static void Open() => GetWindow<ColliderAutoFitterWindow>("Collider Auto Fitter");
 
-    ColliderAutoFitter.ShapeOverride _shapeOverride = ColliderAutoFitter.ShapeOverride.Auto;
+    const string PREF_FOLDER = "CAF_ModuleFolderGUID";
+    const string PREF_SKIP   = "CAF_SkipLowConfidence";
+    const string PREF_FILL   = "CAF_MinFill";
+
+    ColliderAutoFitter.FitMode _mode = ColliderAutoFitter.FitMode.Auto;
+    DefaultAsset _moduleFolder;
+    bool  _skipLowConfidence = true;
+    float _minFill = ColliderAutoFitter.DEFAULT_MIN_FILL;
+
     readonly List<GameObject> _dropTargets = new List<GameObject>();
     Vector2 _scroll;
     bool _showHelp;
 
-    // Repaint while the mouse is inside the window so drop highlight updates.
+    void OnEnable()
+    {
+        string guid = EditorPrefs.GetString(PREF_FOLDER, "");
+        if (!string.IsNullOrEmpty(guid))
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            if (!string.IsNullOrEmpty(path))
+                _moduleFolder = AssetDatabase.LoadAssetAtPath<DefaultAsset>(path);
+        }
+        _skipLowConfidence = EditorPrefs.GetBool(PREF_SKIP, true);
+        _minFill           = EditorPrefs.GetFloat(PREF_FILL, ColliderAutoFitter.DEFAULT_MIN_FILL);
+    }
+
     void OnGUI()
     {
         EditorGUILayout.LabelField("Auto-Fit Collider to Selection", EditorStyles.boldLabel);
         EditorGUILayout.Space();
 
-        // ── Shape override ────────────────────────────────────────────────
-        EditorGUILayout.LabelField("Shape Override", EditorStyles.boldLabel);
-        _shapeOverride = (ColliderAutoFitter.ShapeOverride)EditorGUILayout.EnumPopup(
-            new GUIContent("Shape",
-                "Auto       — detect from mesh (convexity + PCA)\n" +
-                "Container  — hollow open-top object: N wall boxes + bottom box\n" +
-                "Sphere / Capsule / Box — force that primitive, size fit to mesh bounds"),
-            _shapeOverride);
+        // ── Mode ──────────────────────────────────────────────────────────────
+        _mode = (ColliderAutoFitter.FitMode)EditorGUILayout.EnumPopup(
+            new GUIContent("Mode",
+                "Auto      — fit Solid; fall back to Container only if the fit is poor & the shape is round + open\n" +
+                "Container — hollow: 8 wall boxes + 1 bottom box\n" +
+                "Solid     — decompose into primitives (Sphere/Capsule/Cylinder/Box), never walls"),
+            _mode);
 
-        if (_shapeOverride == ColliderAutoFitter.ShapeOverride.Container)
+        switch (_mode)
         {
-            EditorGUILayout.HelpBox(
-                "Container mode: generates " +
-                "8 wall BoxColliders arranged radially\n" +
-                "+ 1 flat BoxCollider for the bottom.\n" +
-                "Sized automatically from the mesh bounds.",
-                MessageType.Info);
-        }
-        else if (_shapeOverride != ColliderAutoFitter.ShapeOverride.Auto)
-        {
-            EditorGUILayout.HelpBox(
-                $"Forces {_shapeOverride} collider.\n" +
-                "Size is always fit tightly to the mesh bounds.",
-                MessageType.Info);
+            case ColliderAutoFitter.FitMode.Container:
+                EditorGUILayout.HelpBox("Generates 8 wall BoxColliders + 1 bottom BoxCollider, "
+                    + "sized from the mesh bounds. Use for buckets, baskets, bowls, crates.", MessageType.Info);
+                break;
+            case ColliderAutoFitter.FitMode.Solid:
+                EditorGUILayout.HelpBox("Splits the mesh into parts (connected components + valley-cut) "
+                    + "and fits one primitive per part. Never produces hollow walls.", MessageType.Info);
+                break;
         }
 
         EditorGUILayout.Space();
 
-        // ── Drop zone ─────────────────────────────────────────────────────
+        // ── Custom collider modules ──────────────────────────────────────────
+        EditorGUILayout.LabelField("Custom Collider Modules", EditorStyles.boldLabel);
+        EditorGUI.BeginChangeCheck();
+        _moduleFolder = (DefaultAsset)EditorGUILayout.ObjectField(
+            new GUIContent("Module Folder",
+                "Folder of prefabs used as custom collider shapes.\n" +
+                "A prefab named 'Cylinder' (unit: diameter 1, height 1 along local Y, " +
+                "collider at origin) is used for cylinder-shaped parts.\n" +
+                "Empty → cylinder parts fall back to a tight Box."),
+            _moduleFolder, typeof(DefaultAsset), false);
+        if (EditorGUI.EndChangeCheck())
+        {
+            string guid = _moduleFolder != null
+                ? AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(_moduleFolder)) : "";
+            EditorPrefs.SetString(PREF_FOLDER, guid);
+        }
+
+        DrawModuleStatus();
+
+        EditorGUILayout.Space();
+
+        // ── Confidence gate ──────────────────────────────────────────────────
+        EditorGUILayout.LabelField("Confidence Gate", EditorStyles.boldLabel);
+        EditorGUI.BeginChangeCheck();
+        _skipLowConfidence = EditorGUILayout.ToggleLeft(
+            new GUIContent("Skip & warn on low confidence",
+                "If the collider fill ratio is below the threshold, remove the colliders and "
+                + "list the object for manual fitting. Off → keep them but still warn."),
+            _skipLowConfidence);
+        _minFill = EditorGUILayout.Slider(
+            new GUIContent("Min fill", "meshVolume / colliderVolume below which a fit is flagged."),
+            _minFill, 0.05f, 0.95f);
+        if (EditorGUI.EndChangeCheck())
+        {
+            EditorPrefs.SetBool(PREF_SKIP, _skipLowConfidence);
+            EditorPrefs.SetFloat(PREF_FILL, _minFill);
+        }
+
+        EditorGUILayout.Space();
+
+        // ── Drop zone ─────────────────────────────────────────────────────────
         DrawDropZone();
 
         EditorGUILayout.Space();
 
-        // ── Target list ───────────────────────────────────────────────────
+        // ── Target list ───────────────────────────────────────────────────────
         var allTargets = BuildTargetList();
-
         if (allTargets.Count > 0)
         {
             EditorGUILayout.LabelField($"Will process {allTargets.Count} object(s):", EditorStyles.boldLabel);
@@ -69,43 +123,76 @@ public class ColliderAutoFitterWindow : EditorWindow
 
         EditorGUILayout.Space();
 
-        // ── Fit button ────────────────────────────────────────────────────
+        // ── Fit button ────────────────────────────────────────────────────────
         GUI.enabled = allTargets.Count > 0;
         if (GUILayout.Button("Fit Collider(s)", GUILayout.Height(36)))
-        {
-            Undo.SetCurrentGroupName("Auto Fit Colliders");
-            int group = Undo.GetCurrentGroup();
-            foreach (var go in allTargets)
-                ColliderAutoFitter.FitCollider(go, _shapeOverride);
-            Undo.CollapseUndoOperations(group);
-            Debug.Log($"[ColliderAutoFitter] Processed {allTargets.Count} object(s).");
-            _dropTargets.Clear();
-        }
+            Process(allTargets);
         GUI.enabled = true;
 
         EditorGUILayout.Space();
-        _showHelp = EditorGUILayout.Foldout(_showHelp, "How it works", true);
-        if (_showHelp)
+        DrawHelp();
+    }
+
+    void Process(List<GameObject> targets)
+    {
+        string folderPath = _moduleFolder != null ? AssetDatabase.GetAssetPath(_moduleFolder) : null;
+        var modules = ColliderAutoFitter.ModuleLibrary.FromFolder(folderPath);
+
+        var opt = new ColliderAutoFitter.FitOptions
         {
-            EditorGUILayout.HelpBox(
-                "AUTO:\n" +
-                "  Convexity = |signed vol| / OBB vol\n" +
-                "  \u2265 35%  \u2192  1 primitive\n" +
-                "  < 35%  \u2192  recursive PCA bisection \u2192 compound\n\n" +
-                "  Shape (PCA extents e0 \u2265 e1 \u2265 e2):\n" +
-                "    e0/e2 < 1.35                    \u2192 Sphere\n" +
-                "    e0/e2 \u2265 2.0, round cross-section \u2192 Capsule\n" +
-                "    otherwise                       \u2192 Box (OBB)\n\n" +
-                "CONTAINER:\n" +
-                "  Skips convexity check.\n" +
-                "  Generates 8 wall slabs (BoxCollider) at equal angles\n" +
-                "  around the rim + 1 flat BoxCollider at the bottom.\n" +
-                "  Use for: buckets, baskets, bowls, crates.",
-                MessageType.None);
+            mode              = _mode,
+            modules           = modules,
+            skipLowConfidence = _skipLowConfidence,
+            minFill           = _minFill,
+        };
+
+        Undo.SetCurrentGroupName("Auto Fit Colliders");
+        int group = Undo.GetCurrentGroup();
+
+        int ok = 0;
+        var flagged = new List<Object>();
+        var sb = new StringBuilder();
+
+        foreach (var go in targets)
+        {
+            var r = ColliderAutoFitter.FitCollider(go, opt);
+            if (r.created && !r.flagged) ok++;
+            if (r.flagged || !r.created)
+            {
+                flagged.Add(go);
+                sb.AppendLine($"• {go.name}   (fill {r.fill:P0}, {r.parts} part(s))");
+            }
+        }
+
+        Undo.CollapseUndoOperations(group);
+        _dropTargets.Clear();
+
+        Debug.Log($"[ColliderAutoFitter] {ok} OK, {flagged.Count} flagged of {targets.Count} object(s).");
+
+        if (flagged.Count > 0)
+        {
+            Selection.objects = flagged.ToArray();
+            EditorUtility.DisplayDialog("Collider Auto Fitter",
+                $"{ok} object(s) fitted.\n\n{flagged.Count} object(s) need a manual collider "
+                + (_skipLowConfidence ? "(low-confidence fits were removed):\n\n" : "(low-confidence, kept):\n\n")
+                + sb,
+                "OK");
         }
     }
 
-    // Returns union of scene-selection + manually dropped objects (deduped).
+    void DrawModuleStatus()
+    {
+        string path = _moduleFolder != null ? AssetDatabase.GetAssetPath(_moduleFolder) : null;
+        if (string.IsNullOrEmpty(path))
+        {
+            EditorGUILayout.HelpBox("No module folder. Cylinder parts will fall back to Box.", MessageType.None);
+            return;
+        }
+        var lib = ColliderAutoFitter.ModuleLibrary.FromFolder(path);
+        string cyl = lib.Has(ColliderAutoFitter.CYLINDER_MODULE) ? "✓ Cylinder" : "✗ no 'Cylinder'";
+        EditorGUILayout.HelpBox($"{lib.Count} module prefab(s) found.   {cyl}", MessageType.None);
+    }
+
     List<GameObject> BuildTargetList()
     {
         var result = new List<GameObject>(Selection.gameObjects);
@@ -117,7 +204,6 @@ public class ColliderAutoFitterWindow : EditorWindow
 
     void DrawDropZone()
     {
-        // Reserve a fixed-height rect for the drop zone.
         Rect dropRect = GUILayoutUtility.GetRect(0, 48, GUILayout.ExpandWidth(true));
 
         bool isHover = dropRect.Contains(Event.current.mousePosition);
@@ -127,10 +213,8 @@ public class ColliderAutoFitterWindow : EditorWindow
         Color boxColor = (isHover && isDragging)
             ? new Color(0.3f, 0.7f, 1f, 0.35f)
             : new Color(0.5f, 0.5f, 0.5f, 0.15f);
-
         EditorGUI.DrawRect(dropRect, boxColor);
 
-        // Dashed border
         Color borderColor = (isHover && isDragging)
             ? new Color(0.3f, 0.7f, 1f, 0.9f)
             : new Color(0.6f, 0.6f, 0.6f, 0.6f);
@@ -142,7 +226,6 @@ public class ColliderAutoFitterWindow : EditorWindow
         GUIStyle labelStyle = new GUIStyle(EditorStyles.centeredGreyMiniLabel) { fontSize = 11 };
         GUI.Label(dropRect, label, labelStyle);
 
-        // Clear button (top-right corner)
         if (_dropTargets.Count > 0)
         {
             Rect clearBtn = new Rect(dropRect.xMax - 52, dropRect.y + 2, 50, 18);
@@ -171,10 +254,8 @@ public class ColliderAutoFitterWindow : EditorWindow
             case EventType.DragPerform:
                 DragAndDrop.AcceptDrag();
                 foreach (var obj in DragAndDrop.objectReferences)
-                {
                     if (obj is GameObject go && !_dropTargets.Contains(go))
                         _dropTargets.Add(go);
-                }
                 evt.Use();
                 Repaint();
                 break;
@@ -183,6 +264,33 @@ public class ColliderAutoFitterWindow : EditorWindow
                 Repaint();
                 break;
         }
+    }
+
+    void DrawHelp()
+    {
+        _showHelp = EditorGUILayout.Foldout(_showHelp, "How it works", true);
+        if (!_showHelp) return;
+
+        EditorGUILayout.HelpBox(
+            "MODES\n" +
+            "  Solid     → connected components + valley-cut decomposition;\n" +
+            "              each part → Sphere / Capsule / Cylinder / Box.\n" +
+            "  Container → 8 wall boxes + 1 bottom box (hollow).\n" +
+            "  Auto      → Solid first; only switches to Container if the Solid\n" +
+            "              fit is poor AND the shape is round + open.\n\n" +
+            "VALLEY-CUT (Solid)\n" +
+            "  Cuts at density gaps (separate branches), radius valleys (necks)\n" +
+            "  and radius shoulders (steps) along the PCA axes.\n\n" +
+            "PART SHAPE (extents e0 ≥ e1 ≥ e2)\n" +
+            "  e0/e2 < 1.35              → Sphere\n" +
+            "  round & length/r ≥ 2.5    → Capsule\n" +
+            "  round & length/r < 2.5    → Cylinder (module) / Box fallback\n" +
+            "  otherwise                 → Box (OBB)\n\n" +
+            "CONFIDENCE\n" +
+            "  fill = meshVolume / colliderVolume.\n" +
+            "  Below 'Min fill' → flagged (and removed if 'Skip' is on); a dialog\n" +
+            "  lists the objects and selects them for manual fitting.",
+            MessageType.None);
     }
 
     static bool HasGameObjects(Object[] refs)
@@ -194,9 +302,9 @@ public class ColliderAutoFitterWindow : EditorWindow
 
     static void DrawBorder(Rect r, Color c)
     {
-        EditorGUI.DrawRect(new Rect(r.x,            r.y,            r.width, 1),      c);
-        EditorGUI.DrawRect(new Rect(r.x,            r.yMax - 1,     r.width, 1),      c);
-        EditorGUI.DrawRect(new Rect(r.x,            r.y,            1,       r.height), c);
-        EditorGUI.DrawRect(new Rect(r.xMax - 1,     r.y,            1,       r.height), c);
+        EditorGUI.DrawRect(new Rect(r.x,        r.y,        r.width, 1),       c);
+        EditorGUI.DrawRect(new Rect(r.x,        r.yMax - 1, r.width, 1),       c);
+        EditorGUI.DrawRect(new Rect(r.x,        r.y,        1,       r.height), c);
+        EditorGUI.DrawRect(new Rect(r.xMax - 1, r.y,        1,       r.height), c);
     }
 }
