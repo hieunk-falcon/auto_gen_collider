@@ -33,76 +33,146 @@ public static class ColliderAutoFitter
     const string PREFIX = "Collider_";
 
     // ── Container ─────────────────────────────────────────────────────────────
-    const int   CONTAINER_WALLS       = 8;
-    const float WALL_THICKNESS_FRAC   = 0.12f;
+    public const int DEFAULT_CONTAINER_WALLS = 8;
+    const float WALL_THICKNESS_FRAC = 0.12f;
     const float BOTTOM_THICKNESS_FRAC = 0.10f;
 
     // ── Valley-cut decomposition ──────────────────────────────────────────────
-    const int   MAX_DEPTH      = 5;     // recursion cap → up to 2^5 before guards
-    const int   MAX_PARTS      = 30;    // hard cap on primitives per object
-    const int   MIN_CLUSTER_V  = 8;     // stop splitting tiny clusters
-    const int   PROFILE_BINS   = 24;    // histogram resolution along an axis
-    const float MIN_CUT_SCORE  = 0.30f; // relative valley/step depth to justify a cut
-    const float EDGE_MARGIN    = 0.12f; // ignore cuts within 12% of either end
+    const int MAX_DEPTH = 5;     // recursion cap → up to 2^5 before guards
+    const int MAX_PARTS = 30;    // hard cap on primitives per object
+    const int MIN_CLUSTER_V = 8;     // stop splitting tiny clusters
+    const int PROFILE_BINS = 24;    // histogram resolution along an axis
+    const float MIN_CUT_SCORE = 0.30f; // relative valley/step depth to justify a cut
+    const float EDGE_MARGIN = 0.12f; // ignore cuts within 12% of either end
 
     // ── Uniform point-cloud sampling ──────────────────────────────────────────
-    const int   SAMPLE_POINTS       = 4096;   // uniform surface samples for PCA / cut analysis
+    const int SAMPLE_POINTS = 4096;   // uniform surface samples for PCA / cut analysis
 
     // ── Small-part pruning ────────────────────────────────────────────────────
-    const float MIN_PART_SIZE_FRAC  = 0.1f;  // skip parts whose largest half-extent < 3% of mesh diagonal
+    const float MIN_PART_SIZE_FRAC = 0.1f;  // skip parts whose largest half-extent < 3% of mesh diagonal
 
     // ── Collider sizing ───────────────────────────────────────────────────────
-    const float RADIUS_PERCENTILE   = 0.95f;  // use 95th-percentile radius to ignore outlier vertices
+    const float RADIUS_PERCENTILE = 0.95f;  // use 95th-percentile radius to ignore outlier vertices
 
     // ── Shape classification ──────────────────────────────────────────────────
-    const float SPHERE_RATIO   = 1.35f; // e0/e2 below → Sphere
-    const float ROUND_RATIO    = 1.6f;  // perp-extent ratio below → round section
+    const float SPHERE_RATIO = 1.35f; // e0/e2 below → Sphere
+    const float ROUND_RATIO = 1.6f;  // perp-extent ratio below → round section
     const float CAPSULE_ASPECT = 2.5f;  // e0/e1 above → elongated tube (capsule chain)
-    const float TUBE_FLATNESS  = 2.2f;  // e1/e2 below → cross-section not a flat ribbon
-    const int   CAP_CHAIN_MAX  = 5;     // max capsules in a chain
+    const float TUBE_FLATNESS = 2.2f;  // e1/e2 below → cross-section not a flat ribbon
+    const int CAP_CHAIN_MAX = 5;     // max capsules in a chain
 
     // ── Auto mode ─────────────────────────────────────────────────────────────
-    const float AUTO_SOLID_OK   = 0.45f; // Solid fill at/above this → keep Solid
+    const float AUTO_SOLID_OK = 0.45f; // Solid fill at/above this → keep Solid
     const float OPEN_EDGE_STRONG = 0.10f; // boundary-edge ratio above → "open"
 
     // ── Symmetry ──────────────────────────────────────────────────────────────
-    const float SYM_THRESHOLD   = 0.80f; // fraction of mirrored verts that must match
+    const float SYM_THRESHOLD = 0.80f; // fraction of mirrored verts that must match
 
     // ── Gate ──────────────────────────────────────────────────────────────────
     public const float DEFAULT_MIN_FILL = 0.35f;
 
-    /// <summary>Name the tool looks for in the module folder for a cylinder.</summary>
+    // ── Module prefab names (file names the tool looks for in the module folder) ─
     public const string CYLINDER_MODULE = "Cylinder";
+    public const string FRUSTUM_CONE_MODULE = "FrustumCone";
+    public const string FRUSTUM_PYRAMID_MODULE = "FrustumPyramid";
+    public const string DOME_MODULE = "Dome";
+
+    // ── Taper / shape thresholds (defaults; overridable per-fit via FitOptions) ─
+    // taper = rTop / rBot, measured along the symmetry axis.
+    //   ≈ 1            → straight side  (Cylinder / Box)
+    //   in [min,max]   → tapered        (FrustumCone / FrustumPyramid)
+    //   < min          → near-pointed   (still tapered, small top)
+    public const float DEFAULT_TAPER_MIN = 0.20f; // below this: very pointed, still tapered
+    public const float DEFAULT_TAPER_MAX = 0.85f; // above this: treat side as straight
+    public const float DEFAULT_TAPER_STRAIGHT = 0.90f; // taper >= this → definitely straight (cyl/box)
+
+    // Cost gate: a mesh-module shape is only worth its physics cost if a plain Box
+    // OBB would waste a lot of extra volume. If the Box wastes less than the
+    // configured fraction, downgrade to Box (cheaper, plenty tight for collision).
+    // Sphere/Capsule/Box are already primitives and pass straight through.
+    static ShapeType ApplyCostGate(ShapeType shape, Vector3[] verts, Vector3 centroid,
+                                   Vector3[] axes, float[] half, ModuleLibrary modules, FitOptions opt)
+    {
+        bool isMeshModule = shape == ShapeType.Cylinder
+                         || shape == ShapeType.FrustumCone
+                         || shape == ShapeType.FrustumPyramid
+                         || shape == ShapeType.Dome;
+        if (!isMeshModule) return shape;
+
+        double boxVol = 8.0 * half[0] * half[1] * half[2];
+        double meshVol = GetSinglePrimitiveVolume(verts, centroid, axes, shape, half, modules);
+        if (meshVol < 1e-9) return shape;
+
+        double boxWaste = (boxVol - meshVol) / meshVol;   // extra volume Box adds
+        if (boxWaste < opt.costGateWaste) return ShapeType.Box;
+        return shape;
+    }
+
+    // Cost gate threshold: a mesh module is kept only if the cheaper Box OBB wastes
+    // MORE than this fraction of extra volume. Box waste below it → downgrade to Box.
+    public const float DEFAULT_COST_GATE_WASTE = 0.30f;
+
+    // Dome auto-detect: |centroid - boundsCenter| along the symmetry axis, as a
+    // fraction of the half-extent on that axis. Symmetric solids ≈ 0; a dome leans
+    // hard toward its flat base. Kept strict — easier to miss than to misclassify.
+    public const float DEFAULT_DOME_OFFSET_MIN = 0.18f;
+
+    // Slicing resolution for taper measurement.
+    const int TAPER_SLICES = 12;
 
     public enum FitMode { Auto, Container, Solid }
-    enum ShapeType { Sphere, Capsule, Cylinder, Box }
+
+    /// <summary>
+    /// Collider shape. Public + serializable so the per-item override component
+    /// (<see cref="ColliderFitOverride"/>) can force a specific shape.
+    /// Auto = let the classifier decide.
+    /// </summary>
+    public enum ShapeType { Auto, Sphere, Capsule, Cylinder, Box, FrustumCone, FrustumPyramid, Dome }
 
     // ── Options & result ──────────────────────────────────────────────────────
 
     public struct FitOptions
     {
-        public FitMode        mode;
-        public ModuleLibrary  modules;
-        public bool           skipLowConfidence;
-        public float          minFill;
-        public bool           showSymmetryPlane;
+        public FitMode mode;
+        public ModuleLibrary modules;
+        public bool skipLowConfidence;
+        public float minFill;
+        public bool showSymmetryPlane;
+        public int containerWalls;
+
+        // ── Tunable shape thresholds (exposed in the Inspector) ───────────────
+        public float taperMin;       // tapered band lower bound
+        public float taperMax;       // tapered band upper bound
+        public float taperStraight;  // >= this → straight side (cyl/box)
+        public float costGateWaste;  // Box waste below this → downgrade mesh→Box
+        public float domeOffsetMin;  // centroid offset to trigger Dome auto-detect
+        public bool enableDomeAuto; // allow auto Dome (off → Dome only via override)
 
         public static FitOptions Default => new FitOptions
         {
-            mode = FitMode.Auto, modules = null,
-            skipLowConfidence = true, minFill = DEFAULT_MIN_FILL,
-            showSymmetryPlane = false
+            mode = FitMode.Auto,
+            modules = null,
+            skipLowConfidence = true,
+            minFill = DEFAULT_MIN_FILL,
+            showSymmetryPlane = false,
+            taperMin = DEFAULT_TAPER_MIN,
+            taperMax = DEFAULT_TAPER_MAX,
+            taperStraight = DEFAULT_TAPER_STRAIGHT,
+            costGateWaste = DEFAULT_COST_GATE_WASTE,
+            domeOffsetMin = DEFAULT_DOME_OFFSET_MIN,
+            enableDomeAuto = true,
+            containerWalls = DEFAULT_CONTAINER_WALLS
         };
     }
 
     public struct FitResult
     {
         public GameObject root;
-        public bool       created;   // colliders are on the object
-        public bool       flagged;   // low confidence (review by hand)
-        public float      fill;      // 0..1 confidence
-        public int        parts;
-        public string     mode;      // human readable for the log
+        public bool created;   // colliders are on the object
+        public bool flagged;   // low confidence (review by hand)
+        public float fill;      // 0..1 confidence
+        public int parts;
+        public string mode;      // human readable for the log
     }
 
     // ── Custom collider module library (prefabs in a folder) ──────────────────
@@ -112,7 +182,7 @@ public static class ColliderAutoFitter
         readonly Dictionary<string, GameObject> _byName =
             new Dictionary<string, GameObject>(System.StringComparer.OrdinalIgnoreCase);
 
-        public int  Count       => _byName.Count;
+        public int Count => _byName.Count;
         public bool Has(string n) => _byName.ContainsKey(n);
         public GameObject Get(string n) => _byName.TryGetValue(n, out var g) ? g : null;
 
@@ -121,13 +191,13 @@ public static class ColliderAutoFitter
         public static ModuleLibrary FromFolder(string assetFolderPath)
         {
             var lib = new ModuleLibrary();
-            if (string.IsNullOrEmpty(assetFolderPath))            return lib;
-            if (!AssetDatabase.IsValidFolder(assetFolderPath))    return lib;
+            if (string.IsNullOrEmpty(assetFolderPath)) return lib;
+            if (!AssetDatabase.IsValidFolder(assetFolderPath)) return lib;
 
             foreach (var guid in AssetDatabase.FindAssets("t:Prefab", new[] { assetFolderPath }))
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
-                var    go   = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+                var go = AssetDatabase.LoadAssetAtPath<GameObject>(path);
                 if (go != null) lib._byName[go.name] = go;
             }
             return lib;
@@ -136,8 +206,14 @@ public static class ColliderAutoFitter
 
     // ── Public API ────────────────────────────────────────────────────────────
 
+    // Current fit options, set at the top of FitCollider so deep helpers
+    // (FitLeaf, capsule-chain sub-fits) can read the tunable thresholds without
+    // threading `opt` through every signature. Editor-only, single-threaded.
+    static FitOptions _opt = FitOptions.Default;
+
     public static FitResult FitCollider(GameObject root, FitOptions opt)
     {
+        _opt = opt;
         var result = new FitResult { root = root, mode = opt.mode.ToString() };
 
         MeshFilter mf = root.GetComponentInChildren<MeshFilter>(true);
@@ -157,12 +233,30 @@ public static class ColliderAutoFitter
         Vector3[] fullCloud = SamplePointCloud(full, SAMPLE_POINTS);
         ComputePCA(fullCloud, out Vector3 centroid, out Vector3[] axes, out float[] extents);
 
+        // ── Per-item override ─────────────────────────────────────────────────
+        // If the object carries a ColliderFitOverride forcing a specific shape,
+        // skip all classification and place exactly that single collider.
+        var ovr = root.GetComponent<ColliderFitOverride>();
+        if (ovr != null && ovr.forcedShape != ColliderFitOverride.Shape.Auto)
+        {
+            ShapeType forced = MapOverride(ovr.forcedShape);
+            RemoveAutoColliders(root);
+            double ovVol = MakeColliderChild(root, PREFIX + "0", full.verts, centroid, axes, forced, opt.modules);
+            float ovFill = (float)Clamp01(MeshVolume(full) / System.Math.Max(ovVol, 1e-9));
+            ovr.lastFill = ovFill; ovr.flaggedForReview = false;
+            result.created = true; result.parts = 1; result.fill = ovFill;
+            result.mode = "Override:" + forced;
+            EditorUtility.SetDirty(root); EditorUtility.SetDirty(ovr);
+            Debug.Log($"[AutoFit] '{root.name}' → Override→{forced} (fill {ovFill:P0})");
+            return result;
+        }
+
         // ── Container (forced) ────────────────────────────────────────────────
         if (opt.mode == FitMode.Container)
         {
             FitContainer(root, full.verts, centroid, axes, extents);
             EditorUtility.SetDirty(root);
-            result.created = true; result.parts = CONTAINER_WALLS + 1; result.mode = "Container";
+            result.created = true; result.parts = opt.containerWalls + 1; result.mode = "Container";
             Debug.Log($"[AutoFit] '{root.name}' → Container ({result.parts} parts)");
             return result;
         }
@@ -180,18 +274,19 @@ public static class ColliderAutoFitter
         }
 
         // Minimum part size: skip fragments < 3% of mesh diagonal.
-        float meshDiag   = 2f * Mathf.Sqrt(extents[0] * extents[0] + extents[1] * extents[1] + extents[2] * extents[2]);
+        float meshDiag = 2f * Mathf.Sqrt(extents[0] * extents[0] + extents[1] * extents[1] + extents[2] * extents[2]);
         float minPartSize = meshDiag * MIN_PART_SIZE_FRAC;
 
         // ── Solid decomposition (used by Solid and Auto) ──────────────────────
         var build = BuildSolid(root, full, fullCloud, opt.modules, centroid, axes, debugContainer, minPartSize, opt.showSymmetryPlane);
         double meshVol = MeshVolume(full);
-        float  fill    = (float)Clamp01(meshVol / System.Math.Max(build.vol, 1e-9));
+        float fill = (float)Clamp01(meshVol / System.Math.Max(build.vol, 1e-9));
         result.parts = build.count;
 
         // Calculate single primitive fit as a fallback/alternative.
-        ShapeType singleShape = Classify(extents, opt.modules);
         Extents(full.verts, centroid, axes, out float[] _, out float[] singleHalf);
+        ShapeType singleShape = Classify(full.verts, centroid, axes, extents, opt.modules, opt);
+        singleShape = ApplyCostGate(singleShape, full.verts, centroid, axes, singleHalf, opt.modules, opt);
         double singleVol = GetSinglePrimitiveVolume(full.verts, centroid, axes, singleShape, singleHalf, opt.modules);
 
         // If decomposition has 0 parts, or if it occupies MORE volume than a single primitive collider
@@ -223,7 +318,7 @@ public static class ColliderAutoFitter
 
             double finalVol = MakeColliderChild(root, PREFIX + "0", full.verts, centroid, axes, singleShape, opt.modules);
             build = (1, finalVol);
-            fill  = (float)Clamp01(meshVol / System.Math.Max(finalVol, 1e-9));
+            fill = (float)Clamp01(meshVol / System.Math.Max(finalVol, 1e-9));
             result.parts = 1;
         }
 
@@ -248,12 +343,12 @@ public static class ColliderAutoFitter
 
         // Poor solid fit → maybe a hollow container.
         bool round = IsRound(extents);
-        bool open  = OpenEdgeRatio(full) > OPEN_EDGE_STRONG;
+        bool open = OpenEdgeRatio(full) > OPEN_EDGE_STRONG;
         if (round && open)
         {
             RemoveAutoColliders(root);                       // drop the solid attempt
             FitContainer(root, full.verts, centroid, axes, extents);
-            result.created = true; result.parts = CONTAINER_WALLS + 1; result.mode = "Auto→Container";
+            result.created = true; result.parts = opt.containerWalls + 1; result.mode = "Auto→Container";
             Debug.Log($"[AutoFit] '{root.name}' → Auto→Container (solid fill {fill:P0}, round+open)");
             EditorUtility.SetDirty(root);
             return result;
@@ -271,6 +366,17 @@ public static class ColliderAutoFitter
     static void ApplyGate(ref FitResult r, GameObject root, float fill, FitOptions opt)
     {
         r.fill = fill;
+
+        // Mirror confidence onto the override component (if present) so the user
+        // can spot low-confidence items in the Inspector and override by hand.
+        var ovr = root.GetComponent<ColliderFitOverride>();
+        if (ovr != null)
+        {
+            ovr.lastFill = fill;
+            ovr.flaggedForReview = fill < opt.minFill;
+            EditorUtility.SetDirty(ovr);
+        }
+
         if (fill >= opt.minFill) return;
 
         r.flagged = true;
@@ -493,11 +599,40 @@ public static class ColliderAutoFitter
         // Symmetric objects (aircraft, characters…) → fit one half + mirror, so
         // mirror-image parts get identical colliders instead of drifting apart.
         // Use uniform cloud (not raw verts) to avoid density-biased symmetry detection.
-        if (TryFindSymmetryPlane(fullCloud, centroid, axes, out Vector3 symN))
-            return BuildSolidSymmetric(root, full, modules, centroid, symN, debugParent, minPartSize, showSymmetryPlane);
+        var syms = FindSymmetryPlanes(fullCloud, centroid, axes);
+        if (syms.Count == 0)
+        {
+            return BuildSolidPlain(root, full, modules, debugParent, minPartSize);
+        }
 
-        return BuildSolidPlain(root, full, modules, debugParent, minPartSize);
+        Vector3 bestNormal = syms[0];
+        if (syms.Count > 1)
+        {
+            double bestVol = double.MaxValue;
+            foreach (var normal in syms)
+            {
+                SplitCluster(full, centroid, normal, out MeshCluster half, out _);
+                if (half.verts.Length < 4) continue;
+
+                var leaves = DecomposeToLeaves(root, half);
+                double totalVol = 0;
+                foreach (var leaf in leaves)
+                {
+                    totalVol += EstimateLeafVolume(leaf, modules);
+                }
+
+                if (totalVol < bestVol)
+                {
+                    bestVol = totalVol;
+                    bestNormal = normal;
+                }
+            }
+            Debug.Log($"[AutoFit] Selected optimal symmetry plane normal: {bestNormal} (estimated total leaf volume: {bestVol:F4}) out of {syms.Count} candidates.");
+        }
+
+        return BuildSolidSymmetric(root, full, modules, centroid, bestNormal, debugParent, minPartSize, showSymmetryPlane);
     }
+
 
     static List<MeshCluster> DecomposeToLeaves(GameObject root, MeshCluster cluster)
     {
@@ -540,7 +675,7 @@ public static class ColliderAutoFitter
         foreach (var v in full.verts) span = Mathf.Max(span, Mathf.Abs(Vector3.Dot(v - centroid, normal)));
         float band = Mathf.Max(span * 0.06f, 1e-4f);
 
-        int    idx = 0;
+        int idx = 0;
         double vol = 0;
         foreach (var leaf in leaves)
         {
@@ -594,10 +729,16 @@ public static class ColliderAutoFitter
         if (ex[0] < minPartSize)
             return 0;
 
+        // if (IsTube(ex))
+        //     return FitCapsuleChain(root, leaf, cloud, ChainSegments(ex), modules, ref idx, debugParent);
         if (IsTube(ex))
-            return FitCapsuleChain(root, leaf, cloud, ChainSegments(ex), modules, ref idx, debugParent);
+            return FitCapsuleChain(root, leaf, cloud, ChainSegments(cloud, c, ax, ex), modules, ref idx, debugParent);
 
-        double v = MakeColliderChild(root, PREFIX + idx, leaf.verts, c, ax, Classify(ex, modules), modules);
+
+        ShapeType shape = Classify(leaf.verts, c, ax, ex, modules, _opt);
+        Extents(leaf.verts, c, ax, out float[] _, out float[] leafHalf);
+        shape = ApplyCostGate(shape, leaf.verts, c, ax, leafHalf, modules, _opt);
+        double v = MakeColliderChild(root, PREFIX + idx, leaf.verts, c, ax, shape, modules);
         CreateDebugMeshForSegment(debugParent, leaf, idx);
         idx++;
         return v;
@@ -606,13 +747,82 @@ public static class ColliderAutoFitter
     // Elongated AND not a flat ribbon → a (possibly curved) round tube.
     static bool IsTube(float[] ex) =>
         ex[0] / Mathf.Max(ex[1], 1e-6f) >= CAPSULE_ASPECT &&
-        ex[1] / Mathf.Max(ex[2], 1e-6f) <  TUBE_FLATNESS;
+        ex[1] / Mathf.Max(ex[2], 1e-6f) < TUBE_FLATNESS;
 
-    static int ChainSegments(float[] ex)
+    // static int ChainSegments(float[] ex)
+    // {
+    //     int n = Mathf.RoundToInt(ex[0] / Mathf.Max(ex[2], 1e-6f) / 1.5f);
+    //     return Mathf.Clamp(n, 1, CAP_CHAIN_MAX);
+    // }
+    static int ChainSegments(Vector3[] cloud, Vector3 centroid, Vector3[] axes, float[] ex)
     {
+        // 1. Tính số phân đoạn dự kiến dựa trên tỷ lệ chiều dài
         int n = Mathf.RoundToInt(ex[0] / Mathf.Max(ex[2], 1e-6f) / 1.5f);
-        return Mathf.Clamp(n, 2, CAP_CHAIN_MAX);
+        n = Mathf.Clamp(n, 1, CAP_CHAIN_MAX);
+
+        if (n <= 1) return 1;
+
+        // 2. Kiểm tra độ cong (Curvature Check)
+        Vector3 mainAxis = axes[0];
+
+        // Tìm điểm giới hạn thực tế của lưới dọc theo trục chính
+        float minP = float.MaxValue, maxP = float.MinValue;
+        foreach (var v in cloud)
+        {
+            float p = Vector3.Dot(v - centroid, mainAxis);
+            if (p < minP) minP = p;
+            if (p > maxP) maxP = p;
+        }
+        float span = maxP - minP;
+        if (span < 1e-4f) return 1;
+
+        // Gom nhóm điểm vào 3 phần: Đầu, Giữa, Cuối
+        Vector3 sumStart = Vector3.zero, sumMid = Vector3.zero, sumEnd = Vector3.zero;
+        int cntStart = 0, cntMid = 0, cntEnd = 0;
+
+        foreach (var v in cloud)
+        {
+            float p = Vector3.Dot(v - centroid, mainAxis);
+            float pct = (p - minP) / span;
+
+            if (pct < 0.33f)
+            {
+                sumStart += v; cntStart++;
+            }
+            else if (pct > 0.66f)
+            {
+                sumEnd += v; cntEnd++;
+            }
+            else
+            {
+                sumMid += v; cntMid++;
+            }
+        }
+
+        if (cntStart == 0 || cntMid == 0 || cntEnd == 0) return 1;
+
+        Vector3 cStart = sumStart / cntStart;
+        Vector3 cMid = sumMid / cntMid;
+        Vector3 cEnd = sumEnd / cntEnd;
+
+        // Tính khoảng cách từ cMid đến đường thẳng nối cStart -> cEnd
+        Vector3 lineDir = (cEnd - cStart).normalized;
+        Vector3 toMid = cMid - cStart;
+        Vector3 projection = cStart + Vector3.Dot(toMid, lineDir) * lineDir;
+        float deflection = Vector3.Distance(cMid, projection);
+
+        // Ngưỡng: Nếu độ lệch tâm < 15% bán kính nhỏ nhất của ống -> coi là thẳng
+        float radius = ex[2];
+        float curvatureThreshold = radius * 0.15f;
+
+        if (deflection < curvatureThreshold)
+        {
+            return 1; // Ống thẳng -> Trả về 1 segment duy nhất
+        }
+
+        return n; // Ống cong -> Trả về n segment để ôm cua
     }
+
 
     // Capsule chain: slice along the long axis, run PCA per slice so each capsule
     // tilts to follow the local tangent of a curved tube (chili, stem, finger…).
@@ -632,7 +842,7 @@ public static class ColliderAutoFitter
             if (p > maxP) maxP = p;
         }
 
-        float binLen  = (maxP - minP) / segments;
+        float binLen = (maxP - minP) / segments;
         float overlap = binLen * 0.25f;
         double vol = 0; int made = 0;
 
@@ -692,6 +902,46 @@ public static class ColliderAutoFitter
         return false;
     }
 
+    static List<Vector3> FindSymmetryPlanes(Vector3[] verts, Vector3 centroid, Vector3[] axes)
+    {
+        var list = new List<Vector3>();
+        if (verts.Length < 16) return list;
+
+        Vector3 mn = verts[0], mx = verts[0];
+        foreach (var v in verts) { mn = Vector3.Min(mn, v); mx = Vector3.Max(mx, v); }
+        float q = Mathf.Max((mx - mn).magnitude * 0.01f, 1e-5f);
+
+        var grid = new HashSet<Vector3Int>();
+        foreach (var v in verts) grid.Add(Quantize(v, q));
+
+        for (int k = 0; k < 3; k++)
+        {
+            int matched = 0;
+            for (int i = 0; i < verts.Length; i++)
+            {
+                Vector3 r = ReflectPoint(verts[i], centroid, axes[k]);
+                if (HasNeighbor(grid, r, q)) matched++;
+            }
+            float s = matched / (float)verts.Length;
+            if (s >= SYM_THRESHOLD)
+            {
+                list.Add(axes[k]);
+            }
+        }
+        return list;
+    }
+
+    static double EstimateLeafVolume(MeshCluster leaf, ModuleLibrary modules)
+    {
+        Vector3[] cloud = SamplePointCloud(leaf, 128);
+        ComputePCA(cloud, out Vector3 c, out Vector3[] ax, out float[] ex);
+        Extents(leaf.verts, c, ax, out float[] _, out float[] leafHalf);
+        ShapeType shape = Classify(leaf.verts, c, ax, ex, modules, _opt);
+        shape = ApplyCostGate(shape, leaf.verts, c, ax, leafHalf, modules, _opt);
+        return GetSinglePrimitiveVolume(leaf.verts, c, ax, shape, leafHalf, modules);
+    }
+
+
     static Vector3Int Quantize(Vector3 v, float q) =>
         new Vector3Int(Mathf.RoundToInt(v.x / q), Mathf.RoundToInt(v.y / q), Mathf.RoundToInt(v.z / q));
 
@@ -699,9 +949,9 @@ public static class ColliderAutoFitter
     {
         Vector3Int b = Quantize(p, q);
         for (int x = -1; x <= 1; x++)
-        for (int y = -1; y <= 1; y++)
-        for (int z = -1; z <= 1; z++)
-            if (grid.Contains(new Vector3Int(b.x + x, b.y + y, b.z + z))) return true;
+            for (int y = -1; y <= 1; y++)
+                for (int z = -1; z <= 1; z++)
+                    if (grid.Contains(new Vector3Int(b.x + x, b.y + y, b.z + z))) return true;
         return false;
     }
 
@@ -797,14 +1047,14 @@ public static class ColliderAutoFitter
             if (span < 1e-5f) continue;
 
             // Histograms: point count + max radius per bin.
-            int[]   cnt = new int[PROFILE_BINS];
+            int[] cnt = new int[PROFILE_BINS];
             float[] rad = new float[PROFILE_BINS];
             for (int i = 0; i < n; i++)
             {
                 int b = Mathf.Clamp((int)((proj[i] - mn) / span * PROFILE_BINS), 0, PROFILE_BINS - 1);
                 cnt[b]++;
-                Vector3 d  = cloud[i] - centroid;
-                float   pe = (d - proj[i] * axis).magnitude;
+                Vector3 d = cloud[i] - centroid;
+                float pe = (d - proj[i] * axis).magnitude;
                 if (pe > rad[b]) rad[b] = pe;
             }
 
@@ -818,9 +1068,9 @@ public static class ColliderAutoFitter
             // 1+2. Density gap & radius valley at interior bin i.
             for (int i = lo; i <= hi; i++)
             {
-                int   leftC = 0, rightC = 0;
+                int leftC = 0, rightC = 0;
                 float leftR = 0f, rightR = 0f;
-                for (int j = 0; j < i; j++) { if (cnt[j] > leftC) leftC = cnt[j];  if (cnt[j] > 0 && rad[j] > leftR) leftR = rad[j]; }
+                for (int j = 0; j < i; j++) { if (cnt[j] > leftC) leftC = cnt[j]; if (cnt[j] > 0 && rad[j] > leftR) leftR = rad[j]; }
                 for (int j = i + 1; j < PROFILE_BINS; j++) { if (cnt[j] > rightC) rightC = cnt[j]; if (cnt[j] > 0 && rad[j] > rightR) rightR = rad[j]; }
 
                 float pos = mn + (i + 0.5f) / PROFILE_BINS * span;
@@ -861,7 +1111,7 @@ public static class ColliderAutoFitter
     static List<MeshCluster> ConnectedComponents(MeshCluster full)
     {
         int[] weld = WeldByPosition(full.verts, out int wc);
-        int[] uf   = new int[wc];
+        int[] uf = new int[wc];
         for (int i = 0; i < wc; i++) uf[i] = i;
 
         for (int i = 0; i < full.tris.Length; i += 3)
@@ -885,7 +1135,7 @@ public static class ColliderAutoFitter
         {
             var remap = new Dictionary<int, int>();
             var verts = new List<Vector3>();
-            var tris  = new List<int>();
+            var tris = new List<int>();
             foreach (int oi in kv.Value)
             {
                 if (!remap.TryGetValue(oi, out int li)) { li = verts.Count; remap[oi] = li; verts.Add(full.verts[oi]); }
@@ -896,85 +1146,262 @@ public static class ColliderAutoFitter
         return result;
     }
 
-    static int  Find(int[] uf, int x) { while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; }
+    static int Find(int[] uf, int x) { while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; }
     static void Union(int[] uf, int a, int b) { a = Find(uf, a); b = Find(uf, b); if (a != b) uf[a] = b; }
 
     // ── Shape classification ──────────────────────────────────────────────────
 
+    // Back-compat shim: extent-only callers route through the geometry-aware path
+    // with neutral taper (straight) and no dome detection.
     static ShapeType Classify(float[] ex, ModuleLibrary modules)
+        => ClassifyCore(ex, 1f, 0f, FitOptions.Default);
+
+    // Geometry-aware classification. Order matters — cheapest primitives first,
+    // mesh modules only when the shape genuinely calls for them.
+    //
+    //   verts/centroid/axes: needed for taper + centroid-offset (dome) signals.
+    //   opt: supplies the tunable thresholds (exposed in the Inspector).
+    static ShapeType Classify(Vector3[] verts, Vector3 centroid, Vector3[] axes,
+                              float[] ex, ModuleLibrary modules, FitOptions opt)
     {
+        int sym = FindSymmetryAxis(ex);
+        Vector3 axis = axes[sym];
+
+        float taper = ComputeTaper(verts, centroid, axis, out float rTop, out float rBot);
+        float offset = CentroidOffset(verts, centroid, axis, ex[sym]);
+
+        return ClassifyCore(ex, taper, offset, opt);
+    }
+
+    // Pure decision given the three signals (extents, taper, centroid offset).
+    static ShapeType ClassifyCore(float[] ex, float taper, float centroidOffset, FitOptions opt)
+    {
+        // Any shape that narrows significantly along the axis is tapered
+        bool tapered = taper < opt.taperMax;
+
+        // 1 ── Sphere: all three extents nearly equal, and NOT tapered.
         float e2 = Mathf.Max(ex[2], 1e-6f);
-        if (ex[0] / e2 < SPHERE_RATIO) return ShapeType.Sphere;
+        if (!tapered && ex[0] / e2 < SPHERE_RATIO) return ShapeType.Sphere;
 
-        int   sym = FindSymmetryAxis(ex);
-        int   o1  = (sym + 1) % 3, o2 = (sym + 2) % 3;
-        float rO  = Mathf.Max(ex[o1], ex[o2]);
-        float rI  = Mathf.Max(Mathf.Min(ex[o1], ex[o2]), 1e-6f);
-        bool  round = (rO / rI) < ROUND_RATIO;
-
-        if (!round) return ShapeType.Box;
+        int sym = FindSymmetryAxis(ex);
+        int o1 = (sym + 1) % 3, o2 = (sym + 2) % 3;
+        float rO = Mathf.Max(ex[o1], ex[o2]);
+        float rI = Mathf.Max(Mathf.Min(ex[o1], ex[o2]), 1e-6f);
+        bool round = (rO / rI) < ROUND_RATIO;   // cross-section close to circular (extent proxy)
 
         float aspect = ex[sym] / Mathf.Max(rO, 1e-6f);
-        if (aspect >= CAPSULE_ASPECT) return ShapeType.Capsule;
+
+        // 3 ── Capsule: round + clearly elongated tube (handled before taper so a
+        //      long pill doesn't get read as a cone).
+        if (round && aspect >= CAPSULE_ASPECT) return ShapeType.Capsule;
+
+        // 4 ── Tapered shapes (frusta). Round → cone, otherwise pyramid.
+        //      Per design decision: when ambiguous, prefer Pyramid (wraps wider,
+        //      never under-covers); the user overrides to Cone when wanted.
+        if (tapered)
+        {
+            if (round)
+            {
+                // Distinguish Dome from FrustumCone:
+                // A Dome has a smaller centroid offset than a Cone for both solid and hollow cases.
+                if (opt.enableDomeAuto && centroidOffset < 0.30f)
+                    return ShapeType.Dome;
+                return ShapeType.FrustumCone;
+            }
+            return ShapeType.FrustumPyramid;
+        }
+
+        // 5 ── Straight-sided.
+        if (!round) return ShapeType.Box;
         return ShapeType.Cylinder; // module if present, else Box fallback
+    }
+
+    // taper = rTop / rBot along the symmetry axis. Slices the cloud into bands and
+    // compares the mean radius of the top band to the bottom band. 1 = straight,
+    // <1 = narrows toward the top. Robust to which end is "top": we orient by the
+    // axis sign from PCA, so taper is reported relative to +axis.
+    static float ComputeTaper(Vector3[] verts, Vector3 centre, Vector3 axis,
+                              out float rTop, out float rBot)
+    {
+        float lo = float.MaxValue, hi = float.MinValue;
+        foreach (var v in verts)
+        {
+            float p = Vector3.Dot(v - centre, axis);
+            if (p < lo) lo = p; if (p > hi) hi = p;
+        }
+        float span = Mathf.Max(hi - lo, 1e-6f);
+
+        // Accumulate radius per slice band.
+        var sumR = new float[TAPER_SLICES];
+        var cnt = new int[TAPER_SLICES];
+        foreach (var v in verts)
+        {
+            Vector3 d = v - centre;
+            float p = Vector3.Dot(d, axis);
+            float perp = (d - p * axis).magnitude;
+            int b = Mathf.Clamp((int)((p - lo) / span * TAPER_SLICES), 0, TAPER_SLICES - 1);
+            sumR[b] += perp; cnt[b]++;
+        }
+
+        // Top = highest populated band, bottom = lowest populated band.
+        rTop = MeanBand(sumR, cnt, TAPER_SLICES - 1, -1);
+        rBot = MeanBand(sumR, cnt, 0, +1);
+        if (rBot < 1e-6f) { rTop = rBot = 1f; return 1f; }
+        // Report relative to the wider end so taper ∈ (0,1]. If the top is wider
+        // than the bottom (object widens upward), swap so taper still reads as the
+        // narrow/wide ratio — the frustum module is symmetric under a flip.
+        float ratio = rTop / rBot;
+        if (ratio > 1f) ratio = rBot / rTop;
+        return Mathf.Clamp01(ratio);
+    }
+
+    // Mean radius of the first populated band scanning from 'start' in 'step' dir.
+    static float MeanBand(float[] sumR, int[] cnt, int start, int step)
+    {
+        for (int i = start; i >= 0 && i < sumR.Length; i += step)
+            if (cnt[i] > 0) return sumR[i] / cnt[i];
+        return 0f;
+    }
+
+    // |centroid - boundsCenter| along the axis, normalised by half-extent.
+    // Symmetric solids ≈ 0; a dome leans toward its flat base.
+    static float CentroidOffset(Vector3[] verts, Vector3 centroid, Vector3 axis, float halfExtent)
+    {
+        float lo = float.MaxValue, hi = float.MinValue;
+        foreach (var v in verts)
+        {
+            float p = Vector3.Dot(v - centroid, axis);
+            if (p < lo) lo = p; if (p > hi) hi = p;
+        }
+        float boundsCenter = (lo + hi) * 0.5f;       // centroid is the origin here, so this is the offset
+        return Mathf.Abs(boundsCenter) / Mathf.Max(halfExtent, 1e-6f);
     }
 
     static bool IsRound(float[] ex)
     {
-        int   sym = FindSymmetryAxis(ex);
-        int   o1  = (sym + 1) % 3, o2 = (sym + 2) % 3;
-        float rO  = Mathf.Max(ex[o1], ex[o2]);
-        float rI  = Mathf.Max(Mathf.Min(ex[o1], ex[o2]), 1e-6f);
+        int sym = FindSymmetryAxis(ex);
+        int o1 = (sym + 1) % 3, o2 = (sym + 2) % 3;
+        float rO = Mathf.Max(ex[o1], ex[o2]);
+        float rI = Mathf.Max(Mathf.Min(ex[o1], ex[o2]), 1e-6f);
         return (rO / rI) < ROUND_RATIO;
+    }
+
+    // Map the runtime override enum onto the internal classifier enum.
+    static ShapeType MapOverride(ColliderFitOverride.Shape s)
+    {
+        switch (s)
+        {
+            case ColliderFitOverride.Shape.Sphere: return ShapeType.Sphere;
+            case ColliderFitOverride.Shape.Capsule: return ShapeType.Capsule;
+            case ColliderFitOverride.Shape.Cylinder: return ShapeType.Cylinder;
+            case ColliderFitOverride.Shape.Box: return ShapeType.Box;
+            case ColliderFitOverride.Shape.FrustumCone: return ShapeType.FrustumCone;
+            case ColliderFitOverride.Shape.FrustumPyramid: return ShapeType.FrustumPyramid;
+            case ColliderFitOverride.Shape.Dome: return ShapeType.Dome;
+            default: return ShapeType.Box;
+        }
+    }
+
+    // Module prefab name for a mesh-module shape (null for primitives).
+    static string ModuleNameFor(ShapeType shape)
+    {
+        switch (shape)
+        {
+            case ShapeType.Cylinder: return CYLINDER_MODULE;
+            case ShapeType.FrustumCone: return FRUSTUM_CONE_MODULE;
+            case ShapeType.FrustumPyramid: return FRUSTUM_PYRAMID_MODULE;
+            case ShapeType.Dome: return DOME_MODULE;
+            default: return null;
+        }
+    }
+
+    // Radius (max perpendicular distance) and height (full extent) along the
+    // symmetry axis, plus the OBB center. Shared by volume + creation paths.
+    static void AxisFit(Vector3[] verts, Vector3 centroid, Vector3[] axes,
+                        out Vector3 center, out Vector3 up, out int sym,
+                        out float radius, out float height)
+    {
+        Extents(verts, centroid, axes, out float[] mid, out float[] halfEx);
+        center = centroid + axes[0] * mid[0] + axes[1] * mid[1] + axes[2] * mid[2];
+        sym = FindSymmetryAxis(halfEx);
+        up = axes[sym];
+        height = 2f * halfEx[sym];
+        radius = 0f;
+        foreach (var v in verts)
+        {
+            Vector3 d = v - center;
+            float pe = (d - Vector3.Dot(d, up) * up).magnitude;
+            if (pe > radius) radius = pe;
+        }
     }
 
     static double GetSinglePrimitiveVolume(Vector3[] verts, Vector3 centroid, Vector3[] axes, ShapeType shape, float[] half, ModuleLibrary modules)
     {
+        double boxVol = 8.0 * half[0] * half[1] * half[2];
         switch (shape)
         {
             case ShapeType.Sphere:
-            {
-                float r = (half[0] + half[1] + half[2]) / 3f;
-                return 4.0 / 3.0 * Mathf.PI * r * r * r;
-            }
+                {
+                    float r = (half[0] + half[1] + half[2]) / 3f;
+                    return 4.0 / 3.0 * Mathf.PI * r * r * r;
+                }
             case ShapeType.Capsule:
-            {
-                Vector3 axis = axes[0];
-                float r = PercentileRadius(verts, centroid, axis, RADIUS_PERCENTILE);
-                float h = Mathf.Max(2f * half[0], 2f * r);
-                double cyl = Mathf.PI * r * r * Mathf.Max(h - 2f * r, 0f);
-                double cap = 4.0 / 3.0 * Mathf.PI * r * r * r;
-                return cyl + cap;
-            }
+                {
+                    Vector3 axis = axes[0];
+                    float r = PercentileRadius(verts, centroid, axis, RADIUS_PERCENTILE);
+                    float h = Mathf.Max(2f * half[0], 2f * r);
+                    double cyl = Mathf.PI * r * r * Mathf.Max(h - 2f * r, 0f);
+                    double cap = 4.0 / 3.0 * Mathf.PI * r * r * r;
+                    return cyl + cap;
+                }
             case ShapeType.Cylinder:
-            {
-                bool hasPrefab = modules != null && modules.Has(CYLINDER_MODULE);
-                if (hasPrefab)
+            case ShapeType.FrustumCone:
+            case ShapeType.FrustumPyramid:
+            case ShapeType.Dome:
                 {
-                    Extents(verts, centroid, axes, out float[] mid, out float[] halfEx);
-                    Vector3 center = centroid + axes[0] * mid[0] + axes[1] * mid[1] + axes[2] * mid[2];
-                    int sym = FindSymmetryAxis(halfEx);
-                    Vector3 up = axes[sym];
-                    float height = 2f * halfEx[sym];
-                    float rad = 0f;
-                    foreach (var v in verts)
+                    string moduleName = ModuleNameFor(shape);
+                    bool hasPrefab = modules != null && modules.Has(moduleName);
+                    if (!hasPrefab) return boxVol;   // no module → falls back to Box anyway
+
+                    AxisFit(verts, centroid, axes, out _, out _, out _, out float rad, out float height);
+                    switch (shape)
                     {
-                        Vector3 d = v - center;
-                        float pe = (d - Vector3.Dot(d, up) * up).magnitude;
-                        if (pe > rad) rad = pe;
+                        // Straight cylinder: π r² h.
+                        case ShapeType.Cylinder:
+                            return Mathf.PI * rad * rad * height;
+                        // Cone frustum: ⅓ π h (R² + Rr + r²). Top radius from taper.
+                        case ShapeType.FrustumCone:
+                            {
+                                int s = FindSymmetryAxisOf(verts, centroid, axes);
+                                float t = ComputeTaper(verts, centroid, axes[s], out _, out _);
+                                float R = rad, rT = rad * Mathf.Clamp01(t);
+                                return Mathf.PI * height / 3.0 * (R * R + R * rT + rT * rT);
+                            }
+                        // Pyramid frustum: ⅓ h (A1 + A2 + √(A1·A2)) with square sections.
+                        case ShapeType.FrustumPyramid:
+                            {
+                                int s = FindSymmetryAxisOf(verts, centroid, axes);
+                                float t = ComputeTaper(verts, centroid, axes[s], out _, out _);
+                                float sBot = 2f * rad, sTop = 2f * rad * Mathf.Clamp01(t);
+                                double a1 = sBot * sBot, a2 = sTop * sTop;
+                                return height / 3.0 * (a1 + a2 + System.Math.Sqrt(a1 * a2));
+                            }
+                        // Dome ≈ half-ellipsoid: ½ · (4/3 π r² (h)) → 2/3 π r² h.
+                        case ShapeType.Dome:
+                            return 2.0 / 3.0 * Mathf.PI * rad * rad * height;
                     }
-                    return Mathf.PI * rad * rad * height;
+                    return boxVol;
                 }
-                else
-                {
-                    return 8.0 * half[0] * half[1] * half[2];
-                }
-            }
             default: // Box
-            {
-                return 8.0 * half[0] * half[1] * half[2];
-            }
+                return boxVol;
         }
+    }
+
+    // Symmetry axis index from raw verts (PCA done inline; small helper for volume calcs).
+    static int FindSymmetryAxisOf(Vector3[] verts, Vector3 centroid, Vector3[] axes)
+    {
+        Extents(verts, centroid, axes, out _, out float[] halfEx);
+        return FindSymmetryAxis(halfEx);
     }
 
     // ── Collider creation (returns the collider's volume for the fill metric) ─
@@ -990,86 +1417,108 @@ public static class ColliderAutoFitter
         switch (shape)
         {
             case ShapeType.Sphere:
-            {
-                // Use OBB center and the average of OBB half-extents for a balanced, tight sphere.
-                float r = (half[0] + half[1] + half[2]) / 3f;
-                var go = NewChild(root, name, center, Quaternion.identity);
-                var sc = go.AddComponent<SphereCollider>();
-                sc.center = Vector3.zero; sc.radius = r;
-                return 4.0 / 3.0 * Mathf.PI * r * r * r;
-            }
+                {
+                    // Use OBB center and the average of OBB half-extents for a balanced, tight sphere.
+                    float r = (half[0] + half[1] + half[2]) / 3f;
+                    var go = NewChild(root, name, center, Quaternion.identity);
+                    var sc = go.AddComponent<SphereCollider>();
+                    sc.center = Vector3.zero; sc.radius = r;
+                    return 4.0 / 3.0 * Mathf.PI * r * r * r;
+                }
 
             case ShapeType.Capsule:
-            {
-                // Length axis = axes[0]; 95th-percentile perpendicular radius.
-                Vector3 axis = axes[0];
-                float r = PercentileRadius(verts, centroid, axis, RADIUS_PERCENTILE);
-                // Height: tight extent along axis + two hemisphere end-caps.
-                float h = Mathf.Max(2f * half[0], 2f * r);
-                var   go = NewChild(root, name, centroid + axis * mid[0], BuildPCARot(axes));
-                var   cc = go.AddComponent<CapsuleCollider>();
-                cc.center = Vector3.zero; cc.direction = 1; cc.radius = r; cc.height = h;
-                double cyl = Mathf.PI * r * r * Mathf.Max(h - 2f * r, 0f);
-                double cap = 4.0 / 3.0 * Mathf.PI * r * r * r;
-                return cyl + cap;
-            }
+                {
+                    // Length axis = axes[0]; 95th-percentile perpendicular radius.
+                    Vector3 axis = axes[0];
+                    float r = PercentileRadius(verts, centroid, axis, RADIUS_PERCENTILE);
+                    // Height: tight extent along axis + two hemisphere end-caps.
+                    float h = Mathf.Max(2f * half[0], 2f * r);
+                    var go = NewChild(root, name, centroid + axis * mid[0], BuildPCARot(axes));
+                    var cc = go.AddComponent<CapsuleCollider>();
+                    cc.center = Vector3.zero; cc.direction = 1; cc.radius = r; cc.height = h;
+                    double cyl = Mathf.PI * r * r * Mathf.Max(h - 2f * r, 0f);
+                    double cap = 4.0 / 3.0 * Mathf.PI * r * r * r;
+                    return cyl + cap;
+                }
 
             case ShapeType.Cylinder:
-            {
-                int     sym = FindSymmetryAxis(half);
-                Vector3 up  = axes[sym];
-                float   height = 2f * half[sym];
-                float   rad = 0f;
-                foreach (var v in verts)
+            case ShapeType.FrustumCone:
+            case ShapeType.FrustumPyramid:
+            case ShapeType.Dome:
                 {
-                    Vector3 d  = v - center;
-                    float   pe = (d - Vector3.Dot(d, up) * up).magnitude;
-                    if (pe > rad) rad = pe;
+                    int sym = FindSymmetryAxis(half);
+                    Vector3 up = axes[sym];
+                    float height = 2f * half[sym];
+                    float rad = 0f;
+                    foreach (var v in verts)
+                    {
+                        Vector3 d = v - center;
+                        float pe = (d - Vector3.Dot(d, up) * up).magnitude;
+                        if (pe > rad) rad = pe;
+                    }
+                    Vector3 pos = center;
+
+                    string moduleName = ModuleNameFor(shape);
+                    GameObject prefab = modules != null ? modules.Get(moduleName) : null;
+                    if (prefab != null)
+                    {
+                        var go = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+                        Undo.RegisterCreatedObjectUndo(go, "AutoFit " + name);
+                        go.name = name;
+                        go.layer = root.layer;
+                        go.transform.SetParent(root.transform, false);
+
+                        // For a tapered/dome module we want +axis to point the same way
+                        // the prefab's tall axis points. PCA axis sign is arbitrary, so
+                        // for Dome we flip so the domed cap sits where the mesh bulges.
+                        Vector3 upOriented = up;
+                        if (shape == ShapeType.Dome || shape == ShapeType.FrustumCone || shape == ShapeType.FrustumPyramid)
+                        {
+                            // Bulk of the mass below center along +axis → cap points -axis.
+                            float massAbove = 0, massBelow = 0;
+                            foreach (var v in verts)
+                            {
+                                float p = Vector3.Dot(v - center, up);
+                                if (p >= 0) massAbove++; else massBelow++;
+                            }
+                            // Prefab convention: wide base at -Y (bottom), narrow/dome at +Y.
+                            // If more mass sits on +axis side, the wide base is there → flip.
+                            if (massAbove > massBelow) upOriented = -up;
+                        }
+
+                        Quaternion rot = BuildAxisRot(upOriented, axes[(sym + 1) % 3]);
+                        Vector3 nat = ModuleLocalSize(prefab);
+                        Vector3 scale = new Vector3(
+                            2f * rad / Mathf.Max(nat.x, 1e-4f),
+                            height / Mathf.Max(nat.y, 1e-4f),
+                            2f * rad / Mathf.Max(nat.z, 1e-4f));
+
+                        Vector3 centerOffset = ModuleLocalCenter(prefab);
+                        Vector3 rotatedOffset = rot * Vector3.Scale(centerOffset, scale);
+                        Vector3 localPos = pos - rotatedOffset;
+
+                        go.transform.localPosition = localPos;
+                        go.transform.localRotation = rot;
+                        go.transform.localScale = scale;
+                        return GetSinglePrimitiveVolume(verts, centroid, axes, shape, half, modules);
+                    }
+
+                    // Fallback: tight OBB (Box) — module prefab not supplied.
+                    var goB = NewChild(root, name, center, BuildPCARot(axes));
+                    var bcB = goB.AddComponent<BoxCollider>();
+                    bcB.center = Vector3.zero;
+                    bcB.size = new Vector3(2f * half[1], 2f * half[0], 2f * half[2]);
+                    return 8.0 * half[0] * half[1] * half[2];
                 }
-                Vector3 pos = center;
-
-                GameObject prefab = modules != null ? modules.Get(CYLINDER_MODULE) : null;
-                if (prefab != null)
-                {
-                    var go = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
-                    Undo.RegisterCreatedObjectUndo(go, "AutoFit " + name);
-                    go.name  = name;
-                    go.layer = root.layer;
-                    go.transform.SetParent(root.transform, false);
-
-                    Quaternion rot = BuildAxisRot(up, axes[(sym + 1) % 3]);
-                    Vector3 nat = ModuleLocalSize(prefab);
-                    Vector3 scale = new Vector3(
-                        2f * rad / Mathf.Max(nat.x, 1e-4f),
-                        height   / Mathf.Max(nat.y, 1e-4f),
-                        2f * rad / Mathf.Max(nat.z, 1e-4f));
-
-                    Vector3 centerOffset = ModuleLocalCenter(prefab);
-                    Vector3 rotatedOffset = rot * Vector3.Scale(centerOffset, scale);
-                    Vector3 localPos = pos - rotatedOffset;
-
-                    go.transform.localPosition = localPos;
-                    go.transform.localRotation = rot;
-                    go.transform.localScale    = scale;
-                    return Mathf.PI * rad * rad * height;
-                }
-
-                // Fallback: tight OBB (Box) — no cylinder module supplied.
-                var goB = NewChild(root, name, center, BuildPCARot(axes));
-                var bcB = goB.AddComponent<BoxCollider>();
-                bcB.center = Vector3.zero;
-                bcB.size   = new Vector3(2f * half[1], 2f * half[0], 2f * half[2]);
-                return 8.0 * half[0] * half[1] * half[2];
-            }
 
             default: // Box (OBB)
-            {
-                var go = NewChild(root, name, center, BuildPCARot(axes));
-                var bc = go.AddComponent<BoxCollider>();
-                bc.center = Vector3.zero;
-                bc.size   = new Vector3(2f * half[1], 2f * half[0], 2f * half[2]);
-                return 8.0 * half[0] * half[1] * half[2];
-            }
+                {
+                    var go = NewChild(root, name, center, BuildPCARot(axes));
+                    var bc = go.AddComponent<BoxCollider>();
+                    bc.center = Vector3.zero;
+                    bc.size = new Vector3(2f * half[1], 2f * half[0], 2f * half[2]);
+                    return 8.0 * half[0] * half[1] * half[2];
+                }
         }
     }
 
@@ -1109,7 +1558,7 @@ public static class ColliderAutoFitter
     static float PercentileRadius(Vector3[] verts, Vector3 centre, Vector3 axis, float p)
     {
         bool usePlain = axis.sqrMagnitude < 1e-8f;
-        var  dists    = new float[verts.Length];
+        var dists = new float[verts.Length];
         for (int i = 0; i < verts.Length; i++)
         {
             if (usePlain)
@@ -1157,7 +1606,7 @@ public static class ColliderAutoFitter
         mid = new float[3]; half = new float[3];
         for (int k = 0; k < 3; k++)
         {
-            mid[k]  = (mn[k] + mx[k]) * 0.5f;
+            mid[k] = (mn[k] + mx[k]) * 0.5f;
             half[k] = (mx[k] - mn[k]) * 0.5f;
         }
     }
@@ -1200,7 +1649,7 @@ public static class ColliderAutoFitter
             {
                 int mid = (lo + hi) >> 1;
                 if (cumArea[mid] >= target) { triIdx = mid; hi = mid - 1; }
-                else                        lo = mid + 1;
+                else lo = mid + 1;
             }
 
             Vector3 va = cluster.verts[cluster.tris[triIdx * 3]];
@@ -1281,7 +1730,7 @@ public static class ColliderAutoFitter
     static void FitContainer(GameObject root, Vector3[] verts,
                               Vector3 centroid, Vector3[] axes, float[] extents)
     {
-        int     symIdx = FindSymmetryAxis(extents);
+        int symIdx = FindSymmetryAxis(extents);
         Vector3 upAxis = axes[symIdx];
         if (Vector3.Dot(upAxis, Vector3.up) < 0f) upAxis = -upAxis;
 
@@ -1289,27 +1738,27 @@ public static class ColliderAutoFitter
         foreach (var v in verts)
         {
             Vector3 d = v - centroid;
-            float   h = Vector3.Dot(d, upAxis);
-            float   r = (d - h * upAxis).magnitude;
+            float h = Vector3.Dot(d, upAxis);
+            float r = (d - h * upAxis).magnitude;
             if (h < minH) minH = h;
             if (h > maxH) maxH = h;
             if (r > maxR) maxR = r;
         }
 
-        float totalH    = maxH - minH;
-        float midH      = (minH + maxH) * 0.5f;
-        float wallThick = Mathf.Max(maxR  * WALL_THICKNESS_FRAC,   0.005f);
-        float botThick  = Mathf.Max(totalH * BOTTOM_THICKNESS_FRAC, 0.005f);
-        float arcWidth  = 2f * maxR * Mathf.Sin(Mathf.PI / CONTAINER_WALLS) * 2.1f;
+        float totalH = maxH - minH;
+        float midH = (minH + maxH) * 0.5f;
+        float wallThick = Mathf.Max(maxR * WALL_THICKNESS_FRAC, 0.005f);
+        float botThick = Mathf.Max(totalH * BOTTOM_THICKNESS_FRAC, 0.005f);
+        float arcWidth = 2f * maxR * Mathf.Sin(Mathf.PI / _opt.containerWalls) * 2.1f;
 
         Vector3 perpA = Vector3.Cross(upAxis, Vector3.up).normalized;
         if (perpA.sqrMagnitude < 0.01f)
             perpA = Vector3.Cross(upAxis, Vector3.right).normalized;
         Vector3 perpB = Vector3.Cross(upAxis, perpA).normalized;
 
-        for (int i = 0; i < CONTAINER_WALLS; i++)
+        for (int i = 0; i < _opt.containerWalls; i++)
         {
-            float   angle  = i * (2f * Mathf.PI / CONTAINER_WALLS);
+            float angle = i * (2f * Mathf.PI / _opt.containerWalls);
             Vector3 outDir = (Mathf.Cos(angle) * perpA + Mathf.Sin(angle) * perpB).normalized;
 
             var go = NewChild(root, string.Format("{0}Wall_{1:D2}", PREFIX, i),
@@ -1317,7 +1766,7 @@ public static class ColliderAutoFitter
                               Quaternion.LookRotation(outDir, upAxis));
             var bc = go.AddComponent<BoxCollider>();
             bc.center = Vector3.zero;
-            bc.size   = new Vector3(arcWidth, totalH, wallThick);
+            bc.size = new Vector3(arcWidth, totalH, wallThick);
         }
 
         Vector3 fwd = Vector3.Cross(perpA, upAxis).normalized;
@@ -1326,7 +1775,7 @@ public static class ColliderAutoFitter
                            Quaternion.LookRotation(fwd, upAxis));
         var botBc = bot.AddComponent<BoxCollider>();
         botBc.center = Vector3.zero;
-        botBc.size   = new Vector3(maxR * 2f, botThick, maxR * 2f);
+        botBc.size = new Vector3(maxR * 2f, botThick, maxR * 2f);
     }
 
     // ── |signed mesh volume| (divergence theorem) ─────────────────────────────
@@ -1379,7 +1828,7 @@ public static class ColliderAutoFitter
         foreach (var v in verts) { mn = Vector3.Min(mn, v); mx = Vector3.Max(mx, v); }
         float q = Mathf.Max((mx - mn).magnitude * 1e-4f, 1e-6f);
 
-        var map  = new Dictionary<Vector3Int, int>();
+        var map = new Dictionary<Vector3Int, int>();
         var weld = new int[verts.Length];
         for (int i = 0; i < verts.Length; i++)
         {
@@ -1402,7 +1851,7 @@ public static class ColliderAutoFitter
         float r1 = Mathf.Min(ex[0], ex[2]) / Mathf.Max(ex[0], 1e-6f);
         float r2 = Mathf.Min(ex[0], ex[1]) / Mathf.Max(ex[0], 1e-6f);
         if (r2 >= r0 && r2 >= r1) return 2;
-        if (r0 >= r1)             return 0;
+        if (r0 >= r1) return 0;
         return 1;
     }
 
@@ -1412,8 +1861,8 @@ public static class ColliderAutoFitter
 
     static Quaternion BuildPCARot(Vector3[] axes)
     {
-        Vector3 up      = axes[0];
-        Vector3 right   = (axes[1] - Vector3.Dot(axes[1], up) * up).normalized;
+        Vector3 up = axes[0];
+        Vector3 right = (axes[1] - Vector3.Dot(axes[1], up) * up).normalized;
         if (right.sqrMagnitude < 0.01f) right = Vector3.right;
         Vector3 forward = Vector3.Cross(right, up).normalized;
         if (forward.sqrMagnitude < 0.01f) forward = Vector3.forward;
@@ -1434,31 +1883,31 @@ public static class ColliderAutoFitter
     // ── PCA (covariance → eigenvectors via power iteration + deflation) ───────
 
     static void ComputePCA(Vector3[] verts,
-                           out Vector3   centroid,
+                           out Vector3 centroid,
                            out Vector3[] axes,
-                           out float[]   halfExtents)
+                           out float[] halfExtents)
     {
         centroid = Vector3.zero;
         foreach (var v in verts) centroid += v;
         centroid /= verts.Length;
 
-        double cxx=0,cxy=0,cxz=0,cyy=0,cyz=0,czz=0;
+        double cxx = 0, cxy = 0, cxz = 0, cyy = 0, cyz = 0, czz = 0;
         foreach (var v in verts)
         {
-            double dx=v.x-centroid.x, dy=v.y-centroid.y, dz=v.z-centroid.z;
-            cxx+=dx*dx; cxy+=dx*dy; cxz+=dx*dz;
-            cyy+=dy*dy; cyz+=dy*dz; czz+=dz*dz;
+            double dx = v.x - centroid.x, dy = v.y - centroid.y, dz = v.z - centroid.z;
+            cxx += dx * dx; cxy += dx * dy; cxz += dx * dz;
+            cyy += dy * dy; cyz += dy * dz; czz += dz * dz;
         }
         double n = verts.Length;
-        var cov = new Mat3((float)(cxx/n),(float)(cxy/n),(float)(cxz/n),
-                           (float)(cxy/n),(float)(cyy/n),(float)(cyz/n),
-                           (float)(cxz/n),(float)(cyz/n),(float)(czz/n));
+        var cov = new Mat3((float)(cxx / n), (float)(cxy / n), (float)(cxz / n),
+                           (float)(cxy / n), (float)(cyy / n), (float)(cyz / n),
+                           (float)(cxz / n), (float)(cyz / n), (float)(czz / n));
 
-        Vector3 e0 = PowerIter(cov,             new Vector3(1f,  0.1f, 0.05f));
-        Vector3 e1 = PowerIter(Deflate(cov,e0), new Vector3(0.05f, 1f, 0.1f));
+        Vector3 e0 = PowerIter(cov, new Vector3(1f, 0.1f, 0.05f));
+        Vector3 e1 = PowerIter(Deflate(cov, e0), new Vector3(0.05f, 1f, 0.1f));
         Vector3 e2 = Vector3.Cross(e0, e1).normalized;
 
-        float h0=0, h1=0, h2=0;
+        float h0 = 0, h1 = 0, h2 = 0;
         foreach (var v in verts)
         {
             Vector3 d = v - centroid;
@@ -1467,21 +1916,21 @@ public static class ColliderAutoFitter
             h2 = Mathf.Max(h2, Mathf.Abs(Vector3.Dot(d, e2)));
         }
 
-        var pairs = new (float h, Vector3 e)[] { (h0,e0),(h1,e1),(h2,e2) };
-        System.Array.Sort(pairs, (a,b) => b.h.CompareTo(a.h));
-        axes        = new Vector3[] { pairs[0].e, pairs[1].e, pairs[2].e };
-        halfExtents = new float[]   { pairs[0].h, pairs[1].h, pairs[2].h };
+        var pairs = new (float h, Vector3 e)[] { (h0, e0), (h1, e1), (h2, e2) };
+        System.Array.Sort(pairs, (a, b) => b.h.CompareTo(a.h));
+        axes = new Vector3[] { pairs[0].e, pairs[1].e, pairs[2].e };
+        halfExtents = new float[] { pairs[0].h, pairs[1].h, pairs[2].h };
     }
 
     struct Mat3
     {
-        public float m00,m01,m02, m10,m11,m12, m20,m21,m22;
-        public Mat3(float a,float b,float c, float d,float e,float f, float g,float h,float k)
-        { m00=a;m01=b;m02=c; m10=d;m11=e;m12=f; m20=g;m21=h;m22=k; }
+        public float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+        public Mat3(float a, float b, float c, float d, float e, float f, float g, float h, float k)
+        { m00 = a; m01 = b; m02 = c; m10 = d; m11 = e; m12 = f; m20 = g; m21 = h; m22 = k; }
         public Vector3 Mul(Vector3 v) => new Vector3(
-            m00*v.x+m01*v.y+m02*v.z,
-            m10*v.x+m11*v.y+m12*v.z,
-            m20*v.x+m21*v.y+m22*v.z);
+            m00 * v.x + m01 * v.y + m02 * v.z,
+            m10 * v.x + m11 * v.y + m12 * v.z,
+            m20 * v.x + m21 * v.y + m22 * v.z);
     }
 
     static Vector3 PowerIter(Mat3 M, Vector3 seed, int iters = 64)
@@ -1499,12 +1948,12 @@ public static class ColliderAutoFitter
 
     static Mat3 Deflate(Mat3 M, Vector3 v)
     {
-        Vector3 Mv     = M.Mul(v);
-        float   lambda = Vector3.Dot(v, Mv);
+        Vector3 Mv = M.Mul(v);
+        float lambda = Vector3.Dot(v, Mv);
         return new Mat3(
-            M.m00-lambda*v.x*v.x, M.m01-lambda*v.x*v.y, M.m02-lambda*v.x*v.z,
-            M.m10-lambda*v.y*v.x, M.m11-lambda*v.y*v.y, M.m12-lambda*v.y*v.z,
-            M.m20-lambda*v.z*v.x, M.m21-lambda*v.z*v.y, M.m22-lambda*v.z*v.z);
+            M.m00 - lambda * v.x * v.x, M.m01 - lambda * v.x * v.y, M.m02 - lambda * v.x * v.z,
+            M.m10 - lambda * v.y * v.x, M.m11 - lambda * v.y * v.y, M.m12 - lambda * v.y * v.z,
+            M.m20 - lambda * v.z * v.x, M.m21 - lambda * v.z * v.y, M.m22 - lambda * v.z * v.z);
     }
 
     static double Clamp01(double x) => x < 0 ? 0 : (x > 1 ? 1 : x);

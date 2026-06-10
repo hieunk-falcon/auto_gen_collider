@@ -12,12 +12,14 @@ public class ColliderAutoFitterWindow : EditorWindow
     const string PREF_SKIP   = "CAF_SkipLowConfidence";
     const string PREF_FILL   = "CAF_MinFill";
     const string PREF_SYM    = "CAF_ShowSymmetryPlane";
+    const string PREF_WALLS  = "CAF_ContainerWalls";
 
     ColliderAutoFitter.FitMode _mode = ColliderAutoFitter.FitMode.Auto;
     DefaultAsset _moduleFolder;
     bool  _skipLowConfidence = true;
     float _minFill = ColliderAutoFitter.DEFAULT_MIN_FILL;
     bool  _showSymmetryPlane = false;
+    int   _containerWalls = ColliderAutoFitter.DEFAULT_CONTAINER_WALLS;
 
     readonly List<GameObject> _dropTargets = new List<GameObject>();
     Vector2 _scroll;
@@ -35,6 +37,7 @@ public class ColliderAutoFitterWindow : EditorWindow
         _skipLowConfidence = EditorPrefs.GetBool(PREF_SKIP, true);
         _minFill           = EditorPrefs.GetFloat(PREF_FILL, ColliderAutoFitter.DEFAULT_MIN_FILL);
         _showSymmetryPlane = EditorPrefs.GetBool(PREF_SYM, false);
+        _containerWalls    = EditorPrefs.GetInt(PREF_WALLS, ColliderAutoFitter.DEFAULT_CONTAINER_WALLS);
     }
 
     void OnGUI()
@@ -46,20 +49,32 @@ public class ColliderAutoFitterWindow : EditorWindow
         _mode = (ColliderAutoFitter.FitMode)EditorGUILayout.EnumPopup(
             new GUIContent("Mode",
                 "Auto      — fit Solid; fall back to Container only if the fit is poor & the shape is round + open\n" +
-                "Container — hollow: 8 wall boxes + 1 bottom box\n" +
+                "Container — hollow: N wall boxes + 1 bottom box\n" +
                 "Solid     — decompose into primitives (Sphere/Capsule/Cylinder/Box), never walls"),
             _mode);
 
         switch (_mode)
         {
             case ColliderAutoFitter.FitMode.Container:
-                EditorGUILayout.HelpBox("Generates 8 wall BoxColliders + 1 bottom BoxCollider, "
+                EditorGUILayout.HelpBox($"Generates {_containerWalls} wall BoxColliders + 1 bottom BoxCollider, "
                     + "sized from the mesh bounds. Use for buckets, baskets, bowls, crates.", MessageType.Info);
                 break;
             case ColliderAutoFitter.FitMode.Solid:
                 EditorGUILayout.HelpBox("Splits the mesh into parts (connected components + valley-cut) "
                     + "and fits one primitive per part. Never produces hollow walls.", MessageType.Info);
                 break;
+        }
+
+        if (_mode == ColliderAutoFitter.FitMode.Container || _mode == ColliderAutoFitter.FitMode.Auto)
+        {
+            EditorGUI.BeginChangeCheck();
+            _containerWalls = EditorGUILayout.IntSlider(
+                new GUIContent("Container Walls", "Number of wall colliders to generate in Container mode."),
+                _containerWalls, 3, 32);
+            if (EditorGUI.EndChangeCheck())
+            {
+                EditorPrefs.SetInt(PREF_WALLS, _containerWalls);
+            }
         }
 
         EditorGUILayout.Space();
@@ -154,14 +169,13 @@ public class ColliderAutoFitterWindow : EditorWindow
         string folderPath = _moduleFolder != null ? AssetDatabase.GetAssetPath(_moduleFolder) : null;
         var modules = ColliderAutoFitter.ModuleLibrary.FromFolder(folderPath);
 
-        var opt = new ColliderAutoFitter.FitOptions
-        {
-            mode              = _mode,
-            modules           = modules,
-            skipLowConfidence = _skipLowConfidence,
-            minFill           = _minFill,
-            showSymmetryPlane = _showSymmetryPlane,
-        };
+        var opt = ColliderAutoFitter.FitOptions.Default;
+        opt.mode              = _mode;
+        opt.modules           = modules;
+        opt.skipLowConfidence = _skipLowConfidence;
+        opt.minFill           = _minFill;
+        opt.showSymmetryPlane = _showSymmetryPlane;
+        opt.containerWalls    = _containerWalls;
 
         Undo.SetCurrentGroupName("Auto Fit Colliders");
         int group = Undo.GetCurrentGroup();
